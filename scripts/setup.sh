@@ -33,15 +33,20 @@ set -Eeuo pipefail
 # ============================================================
 
 INSTANCE="sandbox"
-IMAGE="images:debian/13/amd64"
+IMAGE_ALIAS="images:debian/13/amd64"
+IMAGE_FINGERPRINT="${IMAGE_FINGERPRINT:-}"
+APT_SNAPSHOT_DATE="${APT_SNAPSHOT_DATE:-}"
 
 CONTAINER_USER="user"
 CONTAINER_UID="1000"
 
-INCUS_NETWORK="incusbr0"
+INCUS_NETWORK="sandboxbr0"
 INCUS_IPV4="10.138.67.1/24"
+RESOURCE_OWNER_KEY="user.sandbox.project"
 
 IPTABLES="/usr/sbin/iptables"
+IPTABLES_EGRESS_COMMENT="sandbox-incus-egress"
+IPTABLES_RETURN_COMMENT="sandbox-incus-return"
 
 # ------------------------------------------------------------
 # Logging / errors
@@ -80,8 +85,94 @@ require_command() {
 }
 
 device_exists() {
-    sudo incus config device show "$INSTANCE" 2>/dev/null |
-        grep -q "^${1}:"
+    local device_config
+
+    device_config="$(sudo incus config device show "$INSTANCE")" ||
+        die "Could not read device configuration for $INSTANCE"
+
+    grep -Fxq "${1}:" <<< "$device_config"
+}
+
+device_value() {
+    sudo incus config device get \
+        "$INSTANCE" \
+        "$1" \
+        "$2" \
+        2>/dev/null || true
+}
+
+device_matches() {
+    local device="$1"
+    shift
+
+    local spec key expected actual
+
+    for spec in "$@"; do
+        key="${spec%%=*}"
+        expected="${spec#*=}"
+        actual="$(device_value "$device" "$key")"
+
+        [[ "$actual" == "$expected" ]] || return 1
+    done
+}
+
+ensure_device() {
+    local device="$1"
+    local device_type="$2"
+    shift 2
+
+    if device_exists "$device"; then
+        if device_matches "$device" "type=${device_type}" "$@"; then
+            log "Device already matches: $device"
+            return 0
+        fi
+
+        log "Replacing mismatched device: $device"
+        sudo incus config device remove "$INSTANCE" "$device"
+    fi
+
+    sudo incus config device add \
+        "$INSTANCE" \
+        "$device" \
+        "$device_type" \
+        "$@"
+}
+
+network_value() {
+    sudo incus network get \
+        "$INCUS_NETWORK" \
+        "$1" \
+        2>/dev/null || true
+}
+
+network_matches() {
+    [[ "$(network_value type)" == "bridge" ]] || return 1
+    [[ "$(network_value ipv4.address)" == "$INCUS_IPV4" ]] || return 1
+    [[ "$(network_value ipv4.nat)" == "true" ]] || return 1
+    [[ "$(network_value ipv6.address)" == "none" ]] || return 1
+}
+
+validate_device_names() {
+    local device
+    local device_config
+
+    device_config="$(sudo incus config device show "$INSTANCE")" ||
+        die "Could not read device configuration for $INSTANCE"
+
+    while IFS= read -r device; do
+        case "$device" in
+            root|eth0|project-home|workspace|gpu|wayland|dbus|pulse|runtime)
+                ;;
+            "")
+                ;;
+            *)
+                die "Unexpected local device on $INSTANCE: $device"
+                ;;
+        esac
+    done < <(
+        printf '%s\n' "$device_config" |
+            awk '/^[^[:space:]][^:]*:$/ {sub(/:$/, ""); print}'
+    )
 }
 
 # Add an IPv4 FORWARD rule only when it doesn't already exist.
@@ -96,8 +187,18 @@ iptables_add_once() {
 # ------------------------------------------------------------
 
 require_command sudo
-require_command incus
 require_command ip
+
+if ! command -v incus >/dev/null 2>&1; then
+    require_command apt-get
+
+    log "Installing Incus"
+
+    sudo apt-get update
+    sudo apt-get install -y incus
+fi
+
+require_command incus
 
 [[ -x "$IPTABLES" ]] ||
     die "iptables not found at $IPTABLES"
@@ -105,11 +206,9 @@ require_command ip
 [[ -d "$PROJECT_DIR" ]] ||
     die "Project directory does not exist: $PROJECT_DIR"
 
-mkdir -p "$HOST_HOME"
-mkdir -p "$HOST_WORKSPACE"
-
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
+CURRENT_USER="$(id -un)"
 
 log "Host identity"
 
@@ -118,6 +217,34 @@ echo "GID: $HOST_GID"
 
 if [[ "$HOST_UID" != "$CONTAINER_UID" ]]; then
     die "Expected host UID $CONTAINER_UID, found $HOST_UID"
+fi
+
+WAYLAND_DISPLAY_VALUE="${WAYLAND_DISPLAY:-wayland-0}"
+
+[[ "$WAYLAND_DISPLAY_VALUE" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    die "WAYLAND_DISPLAY must be a simple socket name: $WAYLAND_DISPLAY_VALUE"
+
+[[ "$WAYLAND_DISPLAY_VALUE" != "." && "$WAYLAND_DISPLAY_VALUE" != ".." ]] ||
+    die "Invalid WAYLAND_DISPLAY value: $WAYLAND_DISPLAY_VALUE"
+
+mkdir -p "$HOST_HOME"
+mkdir -p "$HOST_WORKSPACE"
+
+chmod 0700 "$HOST_HOME"
+chmod 0700 "$HOST_WORKSPACE"
+
+if [[ -n "$IMAGE_FINGERPRINT" ]]; then
+    [[ "$IMAGE_FINGERPRINT" =~ ^[0-9a-fA-F]{64}$ ]] ||
+        die "IMAGE_FINGERPRINT must be a full 64-character SHA-256 fingerprint"
+
+    IMAGE="images:${IMAGE_FINGERPRINT}"
+else
+    IMAGE="$IMAGE_ALIAS"
+fi
+
+if [[ -n "$APT_SNAPSHOT_DATE" ]]; then
+    [[ "$APT_SNAPSHOT_DATE" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] ||
+        die "APT_SNAPSHOT_DATE must use YYYYMMDDTHHMMSSZ format"
 fi
 
 # ------------------------------------------------------------
@@ -135,21 +262,6 @@ OUT_IFACE="$(
 log "IPv4 outbound interface: $OUT_IFACE"
 
 # ------------------------------------------------------------
-# Ensure Incus is installed
-# ------------------------------------------------------------
-
-log "Checking Incus installation"
-
-if ! command -v incus >/dev/null 2>&1; then
-
-    log "Installing Incus"
-
-    sudo apt-get update
-    sudo apt-get install -y incus
-
-fi
-
-# ------------------------------------------------------------
 # incus-admin membership
 # ------------------------------------------------------------
 
@@ -157,13 +269,13 @@ log "Checking incus-admin membership"
 
 if getent group incus-admin >/dev/null 2>&1; then
 
-    if ! id -nG "$USER" |
+    if ! id -nG "$CURRENT_USER" |
         tr ' ' '\n' |
         grep -qx incus-admin; then
 
-        sudo usermod -aG incus-admin "$USER"
+        sudo usermod -aG incus-admin "$CURRENT_USER"
 
-        echo "Added $USER to incus-admin."
+        echo "Added $CURRENT_USER to incus-admin."
         echo "Continuing with sudo; no newgrp/re-login required."
 
     fi
@@ -197,24 +309,20 @@ if ! sudo incus network show "$INCUS_NETWORK" >/dev/null 2>&1; then
     sudo incus network create "$INCUS_NETWORK" \
         ipv4.address="$INCUS_IPV4" \
         ipv4.nat=true \
-        ipv6.address=none
+        ipv6.address=none \
+        "${RESOURCE_OWNER_KEY}=${PROJECT_DIR}"
 
 else
 
-    log "Reconciling existing network"
+    log "Validating existing network ownership"
 
-    sudo incus network set \
-        "$INCUS_NETWORK" \
-        ipv4.address "$INCUS_IPV4"
+    NETWORK_OWNER="$(network_value "$RESOURCE_OWNER_KEY")"
 
-    sudo incus network set \
-        "$INCUS_NETWORK" \
-        ipv4.nat true
+    [[ "$NETWORK_OWNER" == "$PROJECT_DIR" ]] ||
+        die "Network $INCUS_NETWORK exists but is not owned by this project; refusing to modify it"
 
-    # Explicitly remove IPv6 from the Incus network.
-    sudo incus network set \
-        "$INCUS_NETWORK" \
-        ipv6.address none
+    network_matches ||
+        die "Owned network $INCUS_NETWORK does not match the expected configuration; refusing to modify it"
 
 fi
 
@@ -258,11 +366,45 @@ if ! sudo incus info "$INSTANCE" >/dev/null 2>&1; then
         "$INSTANCE" \
         --storage "$STORAGE_POOL"
 
+    sudo incus config set \
+        "$INSTANCE" \
+        "${RESOURCE_OWNER_KEY}=${PROJECT_DIR}"
+
 else
 
     log "Instance already exists"
 
+    INSTANCE_OWNER="$(
+        sudo incus config get \
+            "$INSTANCE" \
+            "$RESOURCE_OWNER_KEY" \
+            2>/dev/null || true
+    )"
+
+    [[ "$INSTANCE_OWNER" == "$PROJECT_DIR" ]] ||
+        die "Instance $INSTANCE exists but is not owned by this project; refusing to modify it"
+
 fi
+
+# ------------------------------------------------------------
+# Stop before applying configuration or replacing devices.
+# ------------------------------------------------------------
+
+INSTANCE_STATE="$(
+    sudo incus list "$INSTANCE" \
+        -f csv \
+        -c s
+)"
+
+if [[ "$INSTANCE_STATE" == "RUNNING" || "$INSTANCE_STATE" == "FROZEN" ]]; then
+    log "Stopping instance before configuration"
+    sudo incus stop "$INSTANCE"
+fi
+
+[[ "$INSTANCE_STATE" == "RUNNING" ||
+    "$INSTANCE_STATE" == "FROZEN" ||
+    "$INSTANCE_STATE" == "STOPPED" ]] ||
+    die "Unsupported instance state: $INSTANCE_STATE"
 
 # ------------------------------------------------------------
 # Instance configuration
@@ -274,11 +416,13 @@ sudo incus config set \
     "$INSTANCE" \
     security.privileged false
 
-# Direct host UID/GID mapping.
+# Direct host UID mapping.
 sudo incus config set \
     "$INSTANCE" \
     raw.idmap \
 "uid ${HOST_UID} ${HOST_UID}"
+
+validate_device_names
 
 # ------------------------------------------------------------
 # Root disk
@@ -286,20 +430,12 @@ sudo incus config set \
 
 log "Checking root disk"
 
-if ! device_exists root; then
-
-    sudo incus config device add \
-        "$INSTANCE" \
-        root \
-        disk \
-        path=/ \
-        pool="$STORAGE_POOL"
-
-else
-
-    log "Root disk already exists"
-
-fi
+ensure_device \
+    root \
+    disk \
+    path=/ \
+    pool="$STORAGE_POOL" \
+    readonly=false
 
 # ------------------------------------------------------------
 # Network device
@@ -307,23 +443,11 @@ fi
 
 log "Checking eth0"
 
-if ! device_exists eth0; then
-
-    sudo incus config device add \
-        "$INSTANCE" \
-        eth0 \
-        nic \
-        network="$INCUS_NETWORK" \
-        name=eth0
-
-else
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        eth0 \
-        network "$INCUS_NETWORK"
-
-fi
+ensure_device \
+    eth0 \
+    nic \
+    network="$INCUS_NETWORK" \
+    name=eth0
 
 # ------------------------------------------------------------
 # Project home
@@ -331,28 +455,12 @@ fi
 
 log "Checking project home"
 
-if ! device_exists project-home; then
-
-    sudo incus config device add \
-        "$INSTANCE" \
-        project-home \
-        disk \
-        source="$HOST_HOME" \
-        path="/home/${CONTAINER_USER}"
-
-else
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        project-home \
-        source "$HOST_HOME"
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        project-home \
-        path="/home/${CONTAINER_USER}"
-
-fi
+ensure_device \
+    project-home \
+    disk \
+    source="$HOST_HOME" \
+    path="/home/${CONTAINER_USER}" \
+    readonly=false
 
 # ------------------------------------------------------------
 # Workspace
@@ -360,28 +468,12 @@ fi
 
 log "Checking workspace"
 
-if ! device_exists workspace; then
-
-    sudo incus config device add \
-        "$INSTANCE" \
-        workspace \
-        disk \
-        source="$HOST_WORKSPACE" \
-        path=/workspace
-
-else
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        workspace \
-        source "$HOST_WORKSPACE"
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        workspace \
-        path=/workspace
-
-fi
+ensure_device \
+    workspace \
+    disk \
+    source="$HOST_WORKSPACE" \
+    path=/workspace \
+    readonly=false
 
 # ------------------------------------------------------------
 # GPU
@@ -389,30 +481,11 @@ fi
 
 log "Checking GPU"
 
-if ! device_exists gpu; then
-
-    sudo incus config device add \
-        "$INSTANCE" \
-        gpu \
-        gpu \
-        uid="$HOST_UID" \
-        mode=0660
-
-else
-
-    log "GPU already configured"
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        gpu \
-        uid "$HOST_UID"
-
-    sudo incus config device set \
-        "$INSTANCE" \
-        gpu \
-        mode 0660
-
-fi
+ensure_device \
+    gpu \
+    gpu \
+    uid="$HOST_UID" \
+    mode=0660
 
 # ------------------------------------------------------------
 # Start instance
@@ -479,7 +552,6 @@ sudo incus exec "$INSTANCE" -- mkdir -p /mnt/wayland
 
 log "Configuring Wayland proxy"
 
-WAYLAND_DISPLAY_VALUE="${WAYLAND_DISPLAY:-wayland-0}"
 WAYLAND_SOURCE="/run/user/${HOST_UID}/${WAYLAND_DISPLAY_VALUE}"
 WAYLAND_LISTEN="/mnt/wayland/${WAYLAND_DISPLAY_VALUE}"
 
@@ -580,6 +652,8 @@ log "Checking Incus IPv4 forwarding rules"
 iptables_add_once \
     -i "$INCUS_NETWORK" \
     -o "$OUT_IFACE" \
+    -m comment \
+    --comment "$IPTABLES_EGRESS_COMMENT" \
     -j ACCEPT
 
 iptables_add_once \
@@ -587,6 +661,8 @@ iptables_add_once \
     -o "$INCUS_NETWORK" \
     -m conntrack \
     --ctstate RELATED,ESTABLISHED \
+    -m comment \
+    --comment "$IPTABLES_RETURN_COMMENT" \
     -j ACCEPT
 
 # ------------------------------------------------------------
@@ -607,13 +683,35 @@ sudo incus restart "$INSTANCE"
 
 log "Provisioning container"
 
-sudo incus exec "$INSTANCE" -- bash -s <<'CONTAINER_SCRIPT'
+sudo incus exec "$INSTANCE" \
+    -- env "APT_SNAPSHOT_DATE=$APT_SNAPSHOT_DATE" \
+    bash -s <<'CONTAINER_SCRIPT'
 
 set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
 CONTAINER_USER="user"
+APT_SNAPSHOT_DATE="${APT_SNAPSHOT_DATE:-}"
+
+APT_OPTIONS=()
+
+if [[ -n "$APT_SNAPSHOT_DATE" ]]; then
+
+    echo "==> Using Debian snapshot: $APT_SNAPSHOT_DATE"
+
+    cat > /etc/apt/sources.list.d/99-sandbox-snapshot.list <<EOF
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${APT_SNAPSHOT_DATE}/ trixie main
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${APT_SNAPSHOT_DATE}/ trixie-security main
+EOF
+
+    APT_OPTIONS=(
+        -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/99-sandbox-snapshot.list
+        -o Dir::Etc::sourceparts=-
+        -o Acquire::Check-Valid-Until=false
+    )
+
+fi
 
 # ============================================================
 # APT IPv4-only
@@ -651,7 +749,7 @@ sysctl \
 
 echo "==> Updating package lists"
 
-apt-get update
+apt-get "${APT_OPTIONS[@]}" update
 
 # ============================================================
 # Base packages
@@ -659,7 +757,7 @@ apt-get update
 
 echo "==> Installing base packages"
 
-apt-get install -y \
+apt-get "${APT_OPTIONS[@]}" install -y \
     sudo \
     ca-certificates \
     curl \

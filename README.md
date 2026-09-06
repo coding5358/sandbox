@@ -13,6 +13,11 @@ The sandbox provides an isolated Debian environment while keeping development fi
 * IPv4 networking with NAT
 * Reproducible setup through `scripts/setup.sh`
 
+The setup script owns a project-specific Incus network named `sandboxbr0` and
+records the absolute project path on both the network and container. Existing
+resources with the same names are rejected unless they carry the matching
+ownership marker and expected configuration.
+
 ## Directory Layout
 
 ```text
@@ -38,7 +43,8 @@ The container can therefore be recreated without losing files stored in `home/` 
 
 The host requires:
 
-* Linux with [Incus](https://linuxcontainers.org/incus/) installed
+* Linux with [Incus](https://linuxcontainers.org/incus/) installed (the setup
+  script installs it with `apt-get` if it is missing)
 * `sudo`
 * A Wayland desktop session
 * A GPU exposed through `/dev/dri`
@@ -65,6 +71,18 @@ Run the setup script:
 ```bash
 ./scripts/setup.sh
 ```
+
+For reproducible image and package inputs, provide a full Incus image
+fingerprint and a Debian Snapshot timestamp:
+
+```bash
+IMAGE_FINGERPRINT=<64-character-sha256> \
+APT_SNAPSHOT_DATE=YYYYMMDDTHHMMSSZ \
+./scripts/setup.sh
+```
+
+Without these variables, the script uses the Debian 13 image alias and the
+current Debian package repositories for convenience.
 
 The script creates and configures the Incus container, including:
 
