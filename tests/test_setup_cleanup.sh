@@ -75,6 +75,19 @@ grep -Fq -- '-m comment --comment sandbox-incus-return' "$MOCK_STATE_DIR/iptable
 grep -Fq -- 'APT_SNAPSHOT_DATE=20250101T000000Z' "$MOCK_STATE_DIR/incus.log"
 grep -Fq -- 'https://snapshot.debian.org/archive/debian/${APT_SNAPSHOT_DATE}/' "$MOCK_STATE_DIR/container-script.sh"
 grep -Fq -- 'apt-get "${APT_OPTIONS[@]}" install -y' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- '    gnome-keyring' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'CONTAINER_UID="1000"' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'systemctl --user add-wants default.target gnome-keyring-daemon.service' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'systemctl --user enable gnome-keyring-daemon.socket' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'loginctl enable-linger "$CONTAINER_USER"' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'systemctl start "user@${CONTAINER_UID}.service"' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'busctl --user status org.freedesktop.secrets' "$MOCK_STATE_DIR/container-script.sh"
+grep -Fq -- 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus' "$MOCK_STATE_DIR/container-script.sh"
+
+! grep -Fq -- 'connect=unix:/run/user/1000/bus' "$MOCK_STATE_DIR/devices"
+! grep -Fq -- 'connect=unix:/run/user/1000/runtime' "$MOCK_STATE_DIR/devices"
+! grep -Eq -- '^dbus\||^runtime\||^pulse\|' "$MOCK_STATE_DIR/devices"
+grep -Fq -- '|proxy|bind=container connect=unix:/run/user/1000/wayland-0' "$MOCK_STATE_DIR/devices"
 
 run_setup
 assert_rule_count 3

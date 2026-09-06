@@ -145,8 +145,15 @@ network_value() {
         2>/dev/null || true
 }
 
+network_type() {
+    sudo incus network show \
+        "$INCUS_NETWORK" \
+        2>/dev/null |
+        awk -F': ' '$1 == "type" {print $2; exit}'
+}
+
 network_matches() {
-    [[ "$(network_value type)" == "bridge" ]] || return 1
+    [[ "$(network_type)" == "bridge" ]] || return 1
     [[ "$(network_value ipv4.address)" == "$INCUS_IPV4" ]] || return 1
     [[ "$(network_value ipv4.nat)" == "true" ]] || return 1
     [[ "$(network_value ipv6.address)" == "none" ]] || return 1
@@ -692,6 +699,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 CONTAINER_USER="user"
+CONTAINER_UID="1000"
 APT_SNAPSHOT_DATE="${APT_SNAPSHOT_DATE:-}"
 
 APT_OPTIONS=()
@@ -776,6 +784,7 @@ apt-get "${APT_OPTIONS[@]}" install -y \
     pkg-config \
     dbus \
     dbus-user-session \
+    gnome-keyring \
     fuse3 \
     libfuse2t64 \
     libnspr4 \
@@ -816,6 +825,104 @@ if [[ "$(id -u "$CONTAINER_USER")" != "1000" ]]; then
 
     exit 1
 
+fi
+
+# ============================================================
+# GNOME Keyring Secret Service
+# ============================================================
+#
+# Debian's gnome-keyring package provides the native systemd
+# user unit and the org.freedesktop.secrets D-Bus activation
+# file.  Enable that packaged unit for this container user at
+# default.target so it does not depend on a graphical session.
+#
+# The unit is managed by the user manager and therefore runs as
+# UID 1000.  It connects to the container's own user bus; no
+# host D-Bus socket or host runtime directory is involved.
+#
+# The D-Bus name check makes repeated setup runs safe when the
+# daemon was already started by D-Bus activation or a previous
+# user session.
+# ============================================================
+
+echo "==> Configuring GNOME Keyring Secret Service"
+
+KEYRING_BUS_SOCKET="/run/user/1000/bus"
+
+# A fresh headless container may not have a login-created user session yet.
+# Start the container's own persistent systemd user manager in that case.
+# This creates /run/user/1000 and its local bus; it does not mount or proxy
+# anything from the host.
+if [[ ! -S "$KEYRING_BUS_SOCKET" ]]; then
+    echo "==> Starting container-local user session"
+
+    command -v loginctl >/dev/null 2>&1 || {
+        echo "ERROR: loginctl is required to start the container user session"
+        exit 1
+    }
+
+    command -v systemctl >/dev/null 2>&1 || {
+        echo "ERROR: systemctl is required to start the container user session"
+        exit 1
+    }
+
+    # Linger keeps the UID-1000 user manager available across container and
+    # user-session restarts, without requiring a graphical desktop login.
+    loginctl enable-linger "$CONTAINER_USER"
+    systemctl start "user-runtime-dir@${CONTAINER_UID}.service"
+    systemctl start "user@${CONTAINER_UID}.service"
+
+    for _ in {1..50}; do
+        [[ -S "$KEYRING_BUS_SOCKET" ]] && break
+        sleep 0.1
+    done
+fi
+
+[[ -S "$KEYRING_BUS_SOCKET" ]] || {
+    echo "ERROR: container user D-Bus socket not found: $KEYRING_BUS_SOCKET"
+    exit 1
+}
+
+if ! su - "$CONTAINER_USER" -s /bin/bash -c '
+    set -Eeuo pipefail
+
+    export XDG_RUNTIME_DIR=/run/user/1000
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+    systemctl --user daemon-reload
+
+    # The Debian unit is normally tied to graphical-session-pre.target.
+    # Make it part of this headless user session as well.
+    systemctl --user add-wants default.target gnome-keyring-daemon.service
+    systemctl --user enable gnome-keyring-daemon.socket
+
+    # D-Bus activation and systemd both converge on the same service name.
+    # Do not start another daemon when Secret Service is already owned.
+    if ! busctl --user status org.freedesktop.secrets >/dev/null 2>&1; then
+        systemctl --user start gnome-keyring-daemon.service
+    fi
+
+    busctl --user status org.freedesktop.secrets >/dev/null
+'; then
+    echo "WARNING: user systemd manager is not available; using Debian D-Bus activation"
+
+    su - "$CONTAINER_USER" -s /bin/bash -c '
+        set -Eeuo pipefail
+
+        export XDG_RUNTIME_DIR=/run/user/1000
+        export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+        busctl --user call \
+            org.freedesktop.DBus \
+            /org/freedesktop/DBus \
+            org.freedesktop.DBus \
+            StartServiceByName \
+            su \
+            org.freedesktop.secrets \
+            0 >/dev/null
+
+        busctl --user status org.freedesktop.secrets >/dev/null
+    '
 fi
 
 # ============================================================
@@ -888,6 +995,7 @@ export XDG_RUNTIME_DIR=/mnt/wayland
 export WAYLAND_DISPLAY=wayland-0
 export XDG_SESSION_TYPE=wayland
 export ELECTRON_OZONE_PLATFORM_HINT=wayland
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 EOF
 
 chown 1000:1000 \
