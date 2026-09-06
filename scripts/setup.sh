@@ -394,11 +394,23 @@ if ! device_exists gpu; then
     sudo incus config device add \
         "$INSTANCE" \
         gpu \
-        gpu
+        gpu \
+        uid="$HOST_UID" \
+        mode=0660
 
 else
 
     log "GPU already configured"
+
+    sudo incus config device set \
+        "$INSTANCE" \
+        gpu \
+        uid "$HOST_UID"
+
+    sudo incus config device set \
+        "$INSTANCE" \
+        gpu \
+        mode 0660
 
 fi
 
