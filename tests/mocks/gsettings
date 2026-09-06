@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${MOCK_GSETTINGS_UNAVAILABLE:-0}" == 1 ]]; then
+    exit 127
+fi
+
+[[ "${1:-}" == get ]] || exit 2
+[[ "${2:-}" == org.gnome.desktop.interface ]] || exit 2
+[[ "${3:-}" == color-scheme ]] || exit 2
+
+printf "'%s'\n" "${MOCK_COLOR_SCHEME:-prefer-dark}"

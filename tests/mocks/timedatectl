@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${MOCK_TIMEZONE_UNAVAILABLE:-0}" == 1 ]]; then
+    exit 1
+fi
+
+[[ "$*" == "show --property=Timezone --value" ]] || exit 2
+printf '%s\n' "${MOCK_TIMEZONE:-Australia/Sydney}"

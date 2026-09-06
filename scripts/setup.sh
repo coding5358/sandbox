@@ -84,6 +84,83 @@ require_command() {
         die "Required command not found: $1"
 }
 
+info() {
+    echo "INFO: $*" >&2
+}
+
+is_valid_iana_timezone() {
+    local timezone="$1"
+
+    [[ -n "$timezone" ]] || return 1
+    [[ "$timezone" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ ]] || return 1
+    [[ "$timezone" != *..* ]] || return 1
+
+    case "$timezone" in
+        posix/*|right/*)
+            return 1
+            ;;
+    esac
+
+    [[ -f "/usr/share/zoneinfo/${timezone}" ]]
+}
+
+detect_host_timezone() {
+    local candidate=""
+    local localtime_target=""
+
+    if command -v timedatectl >/dev/null 2>&1; then
+        candidate="$(timedatectl show --property=Timezone --value 2>/dev/null || true)"
+    fi
+
+    if ! is_valid_iana_timezone "$candidate" && [[ -r /etc/timezone ]]; then
+        candidate="$(cat /etc/timezone 2>/dev/null || true)"
+    fi
+
+    if ! is_valid_iana_timezone "$candidate" && [[ -L /etc/localtime ]]; then
+        localtime_target="$(readlink -f -- /etc/localtime 2>/dev/null || true)"
+
+        case "$localtime_target" in
+            /usr/share/zoneinfo/*)
+                candidate="${localtime_target#/usr/share/zoneinfo/}"
+                ;;
+        esac
+    fi
+
+    is_valid_iana_timezone "$candidate" ||
+        die "Could not determine a valid IANA host timezone; timedatectl, /etc/timezone, and /etc/localtime did not provide one"
+
+    printf '%s\n' "$candidate"
+}
+
+detect_host_color_scheme() {
+    local raw_value
+
+    if ! command -v gsettings >/dev/null 2>&1; then
+        info "Host gsettings is unavailable or does not expose the GNOME color-scheme setting; skipping color-scheme synchronization"
+        return 0
+    fi
+
+    if ! raw_value="$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)"; then
+        info "Host gsettings is unavailable or does not expose the GNOME color-scheme setting; skipping color-scheme synchronization"
+        return 0
+    fi
+
+    case "$raw_value" in
+        "'prefer-dark'"|prefer-dark)
+            printf '%s\n' prefer-dark
+            ;;
+        "'prefer-light'"|prefer-light)
+            printf '%s\n' prefer-light
+            ;;
+        "'default'"|default)
+            printf '%s\n' default
+            ;;
+        *)
+            info "Host GNOME color-scheme setting is unavailable or unsupported; skipping color-scheme synchronization"
+            ;;
+    esac
+}
+
 device_exists() {
     local device_config
 
@@ -217,10 +294,41 @@ HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 CURRENT_USER="$(id -un)"
 
+HOST_TIMEZONE="$(detect_host_timezone)"
+HOST_COLOR_SCHEME="$(detect_host_color_scheme)"
+HOST_GTK_THEME=""
+
+case "$HOST_COLOR_SCHEME" in
+    prefer-dark)
+        HOST_GTK_THEME="Adwaita:dark"
+        ;;
+    prefer-light)
+        HOST_GTK_THEME="Adwaita"
+        ;;
+    default|"")
+        ;;
+    *)
+        die "Unsupported host color-scheme value: $HOST_COLOR_SCHEME"
+        ;;
+esac
+
 log "Host identity"
 
 echo "UID: $HOST_UID"
 echo "GID: $HOST_GID"
+echo "Timezone: $HOST_TIMEZONE"
+
+if [[ -n "$HOST_COLOR_SCHEME" ]]; then
+    echo "Color scheme: $HOST_COLOR_SCHEME"
+else
+    echo "Color scheme: unavailable; synchronization skipped"
+fi
+
+if [[ -n "$HOST_GTK_THEME" ]]; then
+    echo "GTK theme override: $HOST_GTK_THEME"
+else
+    echo "GTK theme override: none"
+fi
 
 if [[ "$HOST_UID" != "$CONTAINER_UID" ]]; then
     die "Expected host UID $CONTAINER_UID, found $HOST_UID"
@@ -691,7 +799,11 @@ sudo incus restart "$INSTANCE"
 log "Provisioning container"
 
 sudo incus exec "$INSTANCE" \
-    -- env "APT_SNAPSHOT_DATE=$APT_SNAPSHOT_DATE" \
+    -- env \
+    "APT_SNAPSHOT_DATE=$APT_SNAPSHOT_DATE" \
+    "HOST_TIMEZONE=$HOST_TIMEZONE" \
+    "HOST_COLOR_SCHEME=$HOST_COLOR_SCHEME" \
+    "HOST_GTK_THEME=$HOST_GTK_THEME" \
     bash -s <<'CONTAINER_SCRIPT'
 
 set -Eeuo pipefail
@@ -701,6 +813,9 @@ export DEBIAN_FRONTEND=noninteractive
 CONTAINER_USER="user"
 CONTAINER_UID="1000"
 APT_SNAPSHOT_DATE="${APT_SNAPSHOT_DATE:-}"
+HOST_TIMEZONE="${HOST_TIMEZONE:-}"
+HOST_COLOR_SCHEME="${HOST_COLOR_SCHEME:-}"
+HOST_GTK_THEME="${HOST_GTK_THEME:-}"
 
 APT_OPTIONS=()
 
@@ -782,9 +897,12 @@ apt-get "${APT_OPTIONS[@]}" install -y \
     file \
     build-essential \
     pkg-config \
+    tzdata \
     dbus \
     dbus-user-session \
     gnome-keyring \
+    libglib2.0-bin \
+    gsettings-desktop-schemas \
     fuse3 \
     libfuse2t64 \
     libnspr4 \
@@ -802,6 +920,48 @@ apt-get "${APT_OPTIONS[@]}" install -y \
     pulseaudio-utils \
     xdg-utils \
     desktop-file-utils
+
+# ============================================================
+# Container timezone
+# ============================================================
+#
+# Keep the timezone configuration inside the container.  Do not
+# mount or bind the host's /etc/localtime or /etc/timezone.
+# ============================================================
+
+echo "==> Configuring container timezone: $HOST_TIMEZONE"
+
+is_valid_iana_timezone() {
+    local timezone="$1"
+
+    [[ -n "$timezone" ]] || return 1
+    [[ "$timezone" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ ]] || return 1
+    [[ "$timezone" != *..* ]] || return 1
+
+    case "$timezone" in
+        posix/*|right/*)
+            return 1
+            ;;
+    esac
+
+    [[ -f "/usr/share/zoneinfo/${timezone}" ]]
+}
+
+is_valid_iana_timezone "$HOST_TIMEZONE" || {
+    echo "ERROR: invalid IANA timezone received from host: $HOST_TIMEZONE" >&2
+    exit 1
+}
+
+TIMEZONE_FILE="/usr/share/zoneinfo/${HOST_TIMEZONE}"
+CURRENT_LOCALTIME="$(readlink /etc/localtime 2>/dev/null || true)"
+
+if [[ "$CURRENT_LOCALTIME" != "$TIMEZONE_FILE" ]]; then
+    ln -sfn -- "$TIMEZONE_FILE" /etc/localtime
+fi
+
+if [[ "$(cat /etc/timezone 2>/dev/null || true)" != "$HOST_TIMEZONE" ]]; then
+    printf '%s\n' "$HOST_TIMEZONE" > /etc/timezone
+fi
 
 # ============================================================
 # Container user
@@ -926,6 +1086,93 @@ if ! su - "$CONTAINER_USER" -s /bin/bash -c '
 fi
 
 # ============================================================
+# GNOME color-scheme synchronization
+# ============================================================
+#
+# Apply only the generic color-scheme value, never the host's
+# concrete GTK theme name.  This runs after the container-local
+# user bus has been verified above and never uses the host bus.
+# ============================================================
+
+if [[ -n "$HOST_COLOR_SCHEME" ]]; then
+    if ! su - "$CONTAINER_USER" -s /bin/bash -c '
+        set -Eeuo pipefail
+
+        export XDG_RUNTIME_DIR=/run/user/1000
+        export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+        scheme="$1"
+
+        case "$scheme" in
+            prefer-dark|prefer-light|default)
+                ;;
+            *)
+                echo "ERROR: unsupported color-scheme value: $scheme" >&2
+                exit 1
+                ;;
+        esac
+
+        command -v gsettings >/dev/null 2>&1 || {
+            echo "ERROR: gsettings is unavailable inside the container" >&2
+            exit 1
+        }
+
+        gsettings set \
+            org.gnome.desktop.interface \
+            color-scheme \
+            "$scheme"
+
+        normalize_color_scheme() {
+            case "$1" in
+                ?prefer-dark?|prefer-dark)
+                    printf "%s\n" prefer-dark
+                    ;;
+                ?prefer-light?|prefer-light)
+                    printf "%s\n" prefer-light
+                    ;;
+                ?default?|default)
+                    printf "%s\n" default
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+        }
+
+        actual_raw="$(gsettings get org.gnome.desktop.interface color-scheme)" || {
+            echo "ERROR: could not read back the container color-scheme" >&2
+            exit 1
+        }
+
+        actual="$(normalize_color_scheme "$actual_raw")" || {
+            echo "ERROR: container returned an unsupported color-scheme value: $actual_raw" >&2
+            exit 1
+        }
+
+        [[ "$actual" == "$scheme" ]] || {
+            echo "ERROR: container color-scheme is $actual, expected $scheme" >&2
+            exit 1
+        }
+    ' -- sandbox-color-scheme "$HOST_COLOR_SCHEME"; then
+        echo "ERROR: failed to apply color scheme '$HOST_COLOR_SCHEME' as $CONTAINER_USER using the container-local user bus" >&2
+        exit 1
+    fi
+
+    echo "==> Container color scheme set to $HOST_COLOR_SCHEME"
+else
+    echo "==> Host color scheme unavailable; skipping theme synchronization"
+fi
+
+case "$HOST_GTK_THEME" in
+    ""|Adwaita|Adwaita:dark)
+        ;;
+    *)
+        echo "ERROR: unsupported GTK_THEME value received from host: $HOST_GTK_THEME" >&2
+        exit 1
+        ;;
+esac
+
+# ============================================================
 # Preserve existing shell configuration
 # ============================================================
 #
@@ -997,6 +1244,12 @@ export XDG_SESSION_TYPE=wayland
 export ELECTRON_OZONE_PLATFORM_HINT=wayland
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 EOF
+
+if [[ -n "$HOST_GTK_THEME" ]]; then
+    printf '\n# BEGIN Sandbox-managed GTK_THEME\nexport GTK_THEME=%s\n# END Sandbox-managed GTK_THEME\n' \
+        "$HOST_GTK_THEME" \
+        >> "${USER_HOME}/.gui-env"
+fi
 
 chown 1000:1000 \
     "${USER_HOME}/.gui-env"
@@ -1108,6 +1361,7 @@ sudo incus exec "$INSTANCE" \
         echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
         echo "XDG_SESSION_TYPE=$XDG_SESSION_TYPE"
         echo "ELECTRON_OZONE_PLATFORM_HINT=$ELECTRON_OZONE_PLATFORM_HINT"
+        echo "GTK_THEME=${GTK_THEME:-}"
     '
 
 echo
@@ -1183,7 +1437,4 @@ echo "  incus exec $INSTANCE -- su - $CONTAINER_USER"
 echo
 echo "Enter workspace:"
 echo "  incus exec $INSTANCE -- su - $CONTAINER_USER -c 'cd /workspace && bash'"
-echo
-echo "Run ZCode:"
-echo "  zcode"
 echo
