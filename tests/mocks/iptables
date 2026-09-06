@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RULES="$MOCK_STATE_DIR/iptables.rules"
+touch "$RULES"
+
+case "${1:-}" in
+    -C)
+        [[ "${2:-}" == FORWARD ]]
+        shift 2
+        grep -Fqx -- "$*" "$RULES"
+        ;;
+    -I)
+        [[ "${2:-}" == FORWARD && "${3:-}" == 1 ]]
+        shift 3
+        {
+            printf '%s\n' "$*"
+            cat "$RULES"
+        } > "$RULES.tmp"
+        mv "$RULES.tmp" "$RULES"
+        ;;
+    -D)
+        [[ "${2:-}" == FORWARD && "${3:-}" =~ ^[0-9]+$ ]]
+        sed "${3}d" "$RULES" > "$RULES.tmp"
+        mv "$RULES.tmp" "$RULES"
+        ;;
+    -L)
+        [[ "${2:-}" == FORWARD ]]
+        printf 'num pkts bytes target prot opt source destination options\n'
+        number=1
+        while IFS= read -r rule; do
+            printf '%s 0 0 ACCEPT all -- 0.0.0.0/0 0.0.0.0/0 %s\n' "$number" "$rule"
+            number=$((number + 1))
+        done < "$RULES"
+        ;;
+    -S)
+        [[ "${2:-}" == FORWARD ]]
+        while IFS= read -r rule; do
+            printf '%s\n' "-A FORWARD $rule"
+        done < "$RULES"
+        ;;
+    *)
+        exit 2
+        ;;
+esac

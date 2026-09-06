@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_DIR="$MOCK_STATE_DIR"
+mkdir -p "$STATE_DIR"
+
+NETWORK_EXISTS="$STATE_DIR/network.exists"
+NETWORK_OWNER="$STATE_DIR/network.owner"
+INSTANCE_EXISTS="$STATE_DIR/instance.exists"
+INSTANCE_OWNER="$STATE_DIR/instance.owner"
+INSTANCE_STATE="$STATE_DIR/instance.state"
+DEVICES="$STATE_DIR/devices"
+LOG_FILE="$STATE_DIR/incus.log"
+
+touch "$DEVICES"
+printf 'incus' >> "$LOG_FILE"
+printf ' %q' "$@" >> "$LOG_FILE"
+printf '\n' >> "$LOG_FILE"
+
+network_set_value() {
+    printf '%s\n' "$2" > "$STATE_DIR/network.$1"
+}
+
+network_get_value() {
+    cat "$STATE_DIR/network.$1" 2>/dev/null
+}
+
+device_show() {
+    while IFS='|' read -r name type specs; do
+        [[ -n "$name" ]] || continue
+        printf '%s:\n' "$name"
+        for spec in $specs; do
+            printf '  %s: %s\n' "${spec%%=*}" "${spec#*=}"
+        done
+        printf '  type: %s\n' "$type"
+    done < "$DEVICES"
+}
+
+device_find() {
+    local wanted="$1"
+    awk -F'|' -v wanted="$wanted" '$1 == wanted {print; exit}' "$DEVICES"
+}
+
+device_get() {
+    local device="$1"
+    local key="$2"
+    local record type specs spec
+
+    record="$(device_find "$device")"
+    [[ -n "$record" ]] || exit 1
+
+    IFS='|' read -r device type specs <<< "$record"
+
+    if [[ "$key" == type ]]; then
+        printf '%s\n' "$type"
+        return 0
+    fi
+
+    for spec in $specs; do
+        if [[ "${spec%%=*}" == "$key" ]]; then
+            printf '%s\n' "${spec#*=}"
+            return 0
+        fi
+    done
+
+    exit 1
+}
+
+case "${1:-}" in
+    info)
+        if [[ -z "${2:-}" ]]; then
+            exit 0
+        fi
+        [[ "$2" == sandbox && -f "$INSTANCE_EXISTS" ]]
+        ;;
+    network)
+        case "${2:-}" in
+            show)
+                [[ -f "$NETWORK_EXISTS" ]]
+                ;;
+            create)
+                touch "$NETWORK_EXISTS"
+                network_set_value type bridge
+                for spec in "${@:3}"; do
+                    key="${spec%%=*}"
+                    value="${spec#*=}"
+                    case "$key" in
+                        ipv4.address|ipv4.nat|ipv6.address)
+                            network_set_value "$key" "$value"
+                            ;;
+                        user.sandbox.project)
+                            printf '%s\n' "$value" > "$NETWORK_OWNER"
+                            ;;
+                    esac
+                done
+                ;;
+            get)
+                [[ -f "$NETWORK_EXISTS" ]]
+                key="${4:-}"
+                if [[ "$key" == user.sandbox.project ]]; then
+                    cat "$NETWORK_OWNER"
+                else
+                    network_get_value "$key"
+                fi
+                ;;
+            *)
+                exit 2
+                ;;
+        esac
+        ;;
+    storage)
+        case "${2:-}" in
+            list)
+                printf 'local,dir\n'
+                ;;
+            create)
+                ;;
+            *)
+                exit 2
+                ;;
+        esac
+        ;;
+    init)
+        touch "$INSTANCE_EXISTS"
+        printf 'STOPPED\n' > "$INSTANCE_STATE"
+        ;;
+    config)
+        case "${2:-}" in
+            set)
+                spec="${4:-}"
+                key="${spec%%=*}"
+                value="${spec#*=}"
+                if [[ "$key" == user.sandbox.project ]]; then
+                    printf '%s\n' "$value" > "$INSTANCE_OWNER"
+                fi
+                ;;
+            get)
+                [[ -f "$INSTANCE_EXISTS" ]]
+                key="${4:-}"
+                if [[ "$key" == user.sandbox.project ]]; then
+                    cat "$INSTANCE_OWNER"
+                else
+                    exit 1
+                fi
+                ;;
+            show)
+                printf 'config: mock\n'
+                ;;
+            device)
+                case "${3:-}" in
+                    show)
+                        device_show
+                        ;;
+                    get)
+                        device_get "${5:-}" "${6:-}"
+                        ;;
+                    add)
+                        device="${5:-}"
+                        type="${6:-}"
+                        specs="${*:7}"
+                        printf '%s|%s|%s\n' "$device" "$type" "$specs" >> "$DEVICES"
+                        ;;
+                    remove)
+                        device="${5:-}"
+                        if ! device_find "$device" >/dev/null; then
+                            exit 1
+                        fi
+                        awk -F'|' -v wanted="$device" '$1 != wanted' "$DEVICES" > "$DEVICES.tmp"
+                        mv "$DEVICES.tmp" "$DEVICES"
+                        ;;
+                    *)
+                        exit 2
+                        ;;
+                esac
+                ;;
+            *)
+                exit 2
+                ;;
+        esac
+        ;;
+    list)
+        if [[ "${2:-}" == sandbox ]]; then
+            cat "$INSTANCE_STATE"
+        elif [[ -f "$INSTANCE_EXISTS" ]]; then
+            printf 'sandbox\n'
+        fi
+        ;;
+    start)
+        printf 'RUNNING\n' > "$INSTANCE_STATE"
+        ;;
+    stop)
+        printf 'STOPPED\n' > "$INSTANCE_STATE"
+        ;;
+    restart)
+        printf 'RUNNING\n' > "$INSTANCE_STATE"
+        ;;
+    delete)
+        rm -f "$INSTANCE_EXISTS" "$INSTANCE_OWNER" "$INSTANCE_STATE"
+        : > "$DEVICES"
+        ;;
+    exec)
+        if [[ "$*" == *'bash -s'* ]]; then
+            cat > "$STATE_DIR/container-script.sh"
+        fi
+        ;;
+    admin)
+        ;;
+    *)
+        exit 2
+        ;;
+esac

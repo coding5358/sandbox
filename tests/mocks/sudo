@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+case "${1:-}" in
+    /usr/sbin/iptables)
+        shift
+        exec "$MOCK_IPTABLES" "$@"
+        ;;
+    incus)
+        shift
+        exec "$MOCK_INCUS" "$@"
+        ;;
+    sysctl)
+        shift
+        exec "$MOCK_SYSCTL" "$@"
+        ;;
+    usermod)
+        exit 0
+        ;;
+    *)
+        exec "$@"
+        ;;
+esac

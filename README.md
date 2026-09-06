@@ -84,6 +84,12 @@ APT_SNAPSHOT_DATE=YYYYMMDDTHHMMSSZ \
 Without these variables, the script uses the Debian 13 image alias and the
 current Debian package repositories for convenience.
 
+Run the isolated setup/cleanup regression test with:
+
+```bash
+tests/test_setup_cleanup.sh
+```
+
 The script creates and configures the Incus container, including:
 
 * Debian 13

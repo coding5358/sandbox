@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == -n ]]; then
+    printf '0\n'
+fi
