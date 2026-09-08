@@ -885,6 +885,7 @@ apt-get "${APT_OPTIONS[@]}" install -y \
     ca-certificates \
     curl \
     wget \
+    firefox-esr \
     git \
     vim \
     nano \
@@ -894,6 +895,7 @@ apt-get "${APT_OPTIONS[@]}" install -y \
     iputils-ping \
     dnsutils \
     net-tools \
+    libsecret-tools \
     file \
     build-essential \
     pkg-config \
@@ -1238,8 +1240,8 @@ echo "==> Configuring GUI environment"
 cat > "${USER_HOME}/.gui-env" <<'EOF'
 # Incus Wayland GUI environment
 
-export XDG_RUNTIME_DIR=/mnt/wayland
-export WAYLAND_DISPLAY=wayland-0
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=/mnt/wayland/wayland-0
 export XDG_SESSION_TYPE=wayland
 export ELECTRON_OZONE_PLATFORM_HINT=wayland
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
