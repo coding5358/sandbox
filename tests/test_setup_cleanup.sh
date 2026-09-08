@@ -39,7 +39,7 @@ printf '%s\n' '-s 203.0.113.10 -j DROP' > "$MOCK_STATE_DIR/iptables.rules"
 run_setup() {
     WAYLAND_DISPLAY=wayland-0 \
         APT_SNAPSHOT_DATE=20250101T000000Z \
-        "$PROJECT_DIR/scripts/setup.sh" > "$TEST_DIR/setup.log" 2>&1
+        "$PROJECT_DIR/scripts/setup.sh" "$@" > "$TEST_DIR/setup.log" 2>&1
 }
 
 assert_rule_count() {
@@ -117,6 +117,47 @@ assert_tag_count sandbox-incus-egress 1
 assert_tag_count sandbox-incus-return 1
 [[ "$(grep -Fc -- 'incus config device add' "$MOCK_STATE_DIR/incus.log")" == 7 ]]
 grep -Fqx -- '-s 203.0.113.10 -j DROP' "$MOCK_STATE_DIR/iptables.rules"
+
+printf '%s\n' /tmp/another-project > "$MOCK_STATE_DIR/network.owner"
+if run_setup; then
+    echo "Expected an unowned network to be rejected without --force" >&2
+    exit 1
+fi
+grep -Fq -- 'Network sandboxbr0 exists but is not owned by this project; refusing to modify it' "$TEST_DIR/setup.log"
+
+# Leave only the unowned network for the safe replacement case. In a real
+# Incus deployment, the sandbox instance would itself appear in used_by.
+rm -f \
+    "$MOCK_STATE_DIR/instance.exists" \
+    "$MOCK_STATE_DIR/instance.owner" \
+    "$MOCK_STATE_DIR/instance.state"
+: > "$MOCK_STATE_DIR/devices"
+
+if ! run_setup --force; then
+    cat "$TEST_DIR/setup.log" >&2
+    exit 1
+fi
+[[ "$(grep -Fc -- 'incus network delete sandboxbr0' "$MOCK_STATE_DIR/incus.log")" == 1 ]]
+[[ "$(grep -Fc -- 'incus network create sandboxbr0' "$MOCK_STATE_DIR/incus.log")" == 2 ]]
+grep -Fqx -- "$PROJECT_DIR" "$MOCK_STATE_DIR/network.owner"
+grep -Fqx -- '10.138.67.1/24' "$MOCK_STATE_DIR/network.ipv4.address"
+grep -Fqx -- 'true' "$MOCK_STATE_DIR/network.ipv4.nat"
+grep -Fqx -- 'none' "$MOCK_STATE_DIR/network.ipv6.address"
+
+printf '%s\n' /tmp/another-project > "$MOCK_STATE_DIR/network.owner"
+printf '%s\n' /1.0/profiles/unrelated /1.0/instances/unrelated > "$MOCK_STATE_DIR/network.used_by"
+printf '%s\n' RUNNING > "$MOCK_STATE_DIR/instance.state"
+if run_setup -f; then
+    echo "Expected an attached unowned network to be rejected with --force" >&2
+    exit 1
+fi
+grep -Fq -- 'Cannot replace unowned network sandboxbr0 because it is attached to Incus resources' "$TEST_DIR/setup.log"
+grep -Fq -- '/1.0/profiles/unrelated,/1.0/instances/unrelated' "$TEST_DIR/setup.log"
+[[ "$(grep -Fc -- 'incus network delete sandboxbr0' "$MOCK_STATE_DIR/incus.log")" == 1 ]]
+
+rm -f "$MOCK_STATE_DIR/network.used_by"
+printf '%s\n' "$PROJECT_DIR" > "$MOCK_STATE_DIR/network.owner"
+printf '%s\n' STOPPED > "$MOCK_STATE_DIR/instance.state"
 
 export MOCK_COLOR_SCHEME=prefer-light
 run_setup

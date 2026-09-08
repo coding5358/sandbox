@@ -62,6 +62,43 @@ die() {
     exit 1
 }
 
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  -f, --force    Force replacement of an existing unowned sandboxbr0 network when safe
+  -h, --help     Show this help text
+EOF
+}
+
+FORCE_NETWORK_REPLACEMENT=false
+
+while (($# > 0)); do
+    case "$1" in
+        -f|--force)
+            FORCE_NETWORK_REPLACEMENT=true
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+
+    shift
+done
+
+if (($# > 0)); then
+    die "Unexpected argument: $1"
+fi
+
 # ------------------------------------------------------------
 # Determine project directory from setup.sh location
 # ------------------------------------------------------------
@@ -234,6 +271,44 @@ network_matches() {
     [[ "$(network_value ipv4.address)" == "$INCUS_IPV4" ]] || return 1
     [[ "$(network_value ipv4.nat)" == "true" ]] || return 1
     [[ "$(network_value ipv6.address)" == "none" ]] || return 1
+}
+
+network_attachments() {
+    local network_config
+
+    network_config="$(sudo incus network show "$INCUS_NETWORK")" ||
+        die "Could not inspect attachments for network $INCUS_NETWORK; refusing to delete it"
+
+    grep -Fqx 'used_by: []' <<< "$network_config" ||
+        grep -Fqx 'used_by:' <<< "$network_config" ||
+        die "Could not determine attachments for network $INCUS_NETWORK; refusing to delete it"
+
+    awk '
+        /^used_by:/ {
+            in_used_by=1
+            next
+        }
+
+        in_used_by && /^[[:space:]]*-[[:space:]]*/ {
+            sub(/^[[:space:]]*-[[:space:]]*/, "")
+            print
+            next
+        }
+
+        in_used_by && /^[^[:space:]]/ {
+            in_used_by=0
+        }
+    ' <<< "$network_config"
+}
+
+create_network() {
+    log "Creating IPv4-only network"
+
+    sudo incus network create "$INCUS_NETWORK" \
+        ipv4.address="$INCUS_IPV4" \
+        ipv4.nat=true \
+        ipv6.address=none \
+        "${RESOURCE_OWNER_KEY}=${PROJECT_DIR}"
 }
 
 validate_device_names() {
@@ -419,13 +494,7 @@ log "Checking network: $INCUS_NETWORK"
 
 if ! sudo incus network show "$INCUS_NETWORK" >/dev/null 2>&1; then
 
-    log "Creating IPv4-only network"
-
-    sudo incus network create "$INCUS_NETWORK" \
-        ipv4.address="$INCUS_IPV4" \
-        ipv4.nat=true \
-        ipv6.address=none \
-        "${RESOURCE_OWNER_KEY}=${PROJECT_DIR}"
+    create_network
 
 else
 
@@ -433,11 +502,27 @@ else
 
     NETWORK_OWNER="$(network_value "$RESOURCE_OWNER_KEY")"
 
-    [[ "$NETWORK_OWNER" == "$PROJECT_DIR" ]] ||
-        die "Network $INCUS_NETWORK exists but is not owned by this project; refusing to modify it"
+    if [[ "$NETWORK_OWNER" != "$PROJECT_DIR" ]]; then
+        if [[ "$FORCE_NETWORK_REPLACEMENT" != true ]]; then
+            die "Network $INCUS_NETWORK exists but is not owned by this project; refusing to modify it"
+        fi
 
-    network_matches ||
-        die "Owned network $INCUS_NETWORK does not match the expected configuration; refusing to modify it"
+        log "Checking whether unowned network can be safely replaced"
+
+        NETWORK_ATTACHMENTS="$(network_attachments)"
+
+        if [[ -n "$NETWORK_ATTACHMENTS" ]]; then
+            ATTACHMENT_SUMMARY="$(tr '\n' ',' <<< "$NETWORK_ATTACHMENTS" | sed 's/,$//')"
+            die "Cannot replace unowned network $INCUS_NETWORK because it is attached to Incus resources: $ATTACHMENT_SUMMARY; refusing to delete it"
+        fi
+
+        log "Replacing unowned network"
+        sudo incus network delete "$INCUS_NETWORK"
+        create_network
+    else
+        network_matches ||
+            die "Owned network $INCUS_NETWORK does not match the expected configuration; refusing to modify it"
+    fi
 
 fi
 

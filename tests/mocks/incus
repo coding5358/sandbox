@@ -78,9 +78,16 @@ case "${1:-}" in
             show)
                 [[ -f "$NETWORK_EXISTS" ]]
                 printf 'type: %s\n' "$(network_get_value type)"
+                if [[ -s "$STATE_DIR/network.used_by" ]]; then
+                    printf 'used_by:\n'
+                    sed 's/^/- /' "$STATE_DIR/network.used_by"
+                else
+                    printf 'used_by: []\n'
+                fi
                 ;;
             create)
                 touch "$NETWORK_EXISTS"
+                rm -f "$STATE_DIR/network.used_by"
                 network_set_value type bridge
                 for spec in "${@:3}"; do
                     key="${spec%%=*}"
@@ -94,6 +101,9 @@ case "${1:-}" in
                             ;;
                     esac
                 done
+                ;;
+            delete)
+                rm -f "$NETWORK_EXISTS" "$NETWORK_OWNER" "$STATE_DIR/network.type" "$STATE_DIR/network.ipv4.address" "$STATE_DIR/network.ipv4.nat" "$STATE_DIR/network.ipv6.address" "$STATE_DIR/network.used_by"
                 ;;
             get)
                 [[ -f "$NETWORK_EXISTS" ]]
